@@ -5,10 +5,11 @@
 The pipeline is intentionally simple:
 
 1. Load the image on the CPU.
-2. Run grayscale smoothing and Sobel edge extraction on the GPU with NPP.
-3. Build a binary candidate mask with CUDA kernels.
-4. Score connected components on the CPU using license-plate-like geometry.
-5. Draw a rectangle on the original image and save `<input>-out.<ext>`.
+2. Convert to grayscale on the GPU.
+3. Run Gaussian smoothing and Sobel edge extraction on the GPU with NPP.
+4. Build the binary candidate mask on the GPU.
+5. Score connected components on the CPU using license-plate-like geometry.
+6. Draw a rectangle on the original image and save `<input>-out.<ext>`.
 
 This is a baseline detector, not a trained model. It works best on single-vehicle images with one clearly visible front or rear plate.
 
@@ -83,6 +84,17 @@ Run the program on a Linux machine with a working CUDA runtime:
 ```
 
 If a plausible candidate is found, the tool writes `data/images/samples/audi-out.png`.
+
+To save the intermediate GPU stages under a `debug/` folder beside the input
+image, use:
+
+```bash
+./bin/plate --debug data/images/samples/audi.png
+```
+
+This writes files such as `debug/audi-grayscale.png`,
+`debug/audi-gauss-blur.png`, `debug/audi-sobel-edge.png`,
+`debug/audi-binary-mask.png`, and `debug/audi-closed-mask.png`.
 
 ## Notes and limitations
 

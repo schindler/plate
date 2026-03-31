@@ -36,6 +36,7 @@ target_link_libraries(plate_lib
     PUBLIC
         CUDA::cudart
         CUDA::nppc
+        CUDA::nppicc
         CUDA::nppif
         ${OpenCV_LIBS}
 )

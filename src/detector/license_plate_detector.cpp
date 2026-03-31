@@ -103,13 +103,16 @@ struct Component {
 
 }  // namespace
 
-DetectionResult detect_license_plate(const image::ImageBuffer &grayscale) {
-  if (grayscale.channels != 1) {
+DetectionResult detect_license_plate(
+    const image::ImageBuffer &source_image,
+    const filter::FilterStageCallback &stage_callback) {
+  if (source_image.channels != 1 && source_image.channels != 3) {
     throw std::invalid_argument(
-        "License plate detection expects a grayscale image.");
+        "License plate detection expects a 1-channel or 3-channel image.");
   }
 
-  const auto mask = filter::build_plate_candidate_mask(grayscale);
+  const auto mask =
+      filter::build_plate_candidate_mask(source_image, {}, stage_callback);
   const int width = mask.width;
   const int height = mask.height;
 

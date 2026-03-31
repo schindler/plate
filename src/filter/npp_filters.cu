@@ -1,9 +1,12 @@
 #include <cuda_runtime.h>
-#include <npp.h>
+#include <nppcore.h>
+#include <nppi_color_conversion.h>
+#include <nppi_filtering_functions.h>
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 #include "plate/core/cuda_check.hpp"
 #include "plate/filter/npp_filters.hpp"
@@ -90,8 +93,33 @@ __global__ void gradient_threshold_kernel(
       reinterpret_cast<char *>(destination) + y * destination_pitch);
 
   const int magnitude =
-      abs(row_x[x]) + abs(row_y[x]);
+      abs(static_cast<int>(row_x[x])) + abs(static_cast<int>(row_y[x]));
   row_destination[x] = magnitude >= threshold ? 255 : 0;
+}
+
+__global__ void gradient_visualization_kernel(
+    const Npp16s *gradient_x, const std::size_t gradient_x_pitch,
+    const Npp16s *gradient_y, const std::size_t gradient_y_pitch,
+    Npp8u *destination, const std::size_t destination_pitch, const int width,
+    const int height, const int scale_divisor) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (x >= width || y >= height) {
+    return;
+  }
+
+  const auto *row_x = reinterpret_cast<const Npp16s *>(
+      reinterpret_cast<const char *>(gradient_x) + y * gradient_x_pitch);
+  const auto *row_y = reinterpret_cast<const Npp16s *>(
+      reinterpret_cast<const char *>(gradient_y) + y * gradient_y_pitch);
+  auto *row_destination = reinterpret_cast<Npp8u *>(
+      reinterpret_cast<char *>(destination) + y * destination_pitch);
+
+  const int magnitude =
+      abs(static_cast<int>(row_x[x])) + abs(static_cast<int>(row_y[x]));
+  const int scaled_value = magnitude / max(1, scale_divisor);
+  row_destination[x] = static_cast<Npp8u>(min(255, scaled_value));
 }
 
 __global__ void dilate_rect_kernel(const Npp8u *source,
@@ -182,80 +210,159 @@ void launch_rect_kernel(dim3 grid, dim3 block, const bool is_dilation,
   }
 }
 
+NppStreamContext get_npp_stream_context() {
+  int cuda_device_id = 0;
+  cudaDeviceProp device_properties{};
+  NppStreamContext stream_context{};
+  PLATE_CUDA_CHECK(cudaGetDevice(&cuda_device_id));
+  PLATE_CUDA_CHECK(cudaGetDeviceProperties(&device_properties, cuda_device_id));
+
+  stream_context.hStream = cudaStream_t{};
+  stream_context.nCudaDeviceId = cuda_device_id;
+  stream_context.nMultiProcessorCount = device_properties.multiProcessorCount;
+  stream_context.nMaxThreadsPerMultiProcessor =
+      device_properties.maxThreadsPerMultiProcessor;
+  stream_context.nMaxThreadsPerBlock = device_properties.maxThreadsPerBlock;
+  stream_context.nSharedMemPerBlock = device_properties.sharedMemPerBlock;
+  stream_context.nCudaDevAttrComputeCapabilityMajor = device_properties.major;
+  stream_context.nCudaDevAttrComputeCapabilityMinor = device_properties.minor;
+  stream_context.nStreamFlags = 0;
+  stream_context.nReserved0 = 0;
+  return stream_context;
+}
+
+image::ImageBuffer copy_device_image_to_host(const DeviceImage<Npp8u> &device,
+                                             const int width,
+                                             const int height) {
+  image::ImageBuffer host_image;
+  host_image.width = width;
+  host_image.height = height;
+  host_image.channels = 1;
+  host_image.row_stride = width;
+  host_image.pixels.resize(static_cast<std::size_t>(host_image.row_stride) *
+                           host_image.height);
+  device.copy_to_host(host_image.pixels.data(), host_image.row_stride);
+  return host_image;
+}
+
+void emit_stage_if_requested(const DeviceImage<Npp8u> &device_image,
+                             const int width, const int height,
+                             const std::string_view stage_name,
+                             const FilterStageCallback &stage_callback) {
+  if (!stage_callback) {
+    return;
+  }
+
+  stage_callback(stage_name,
+                 copy_device_image_to_host(device_image, width, height));
+}
+
 }  // namespace
 
 image::ImageBuffer build_plate_candidate_mask(
-    const image::ImageBuffer &grayscale, const PlateMaskConfig &config) {
-  if (grayscale.channels != 1) {
+    const image::ImageBuffer &source_image, const PlateMaskConfig &config,
+    const FilterStageCallback &stage_callback) {
+  if (source_image.channels != 1 && source_image.channels != 3) {
     throw std::invalid_argument(
-        "Plate mask generation expects a grayscale image.");
+        "Plate mask generation expects a 1-channel or 3-channel image.");
   }
 
-  if (grayscale.row_stride < grayscale.width) {
-    throw std::invalid_argument("Invalid grayscale row stride.");
+  if (source_image.row_stride < source_image.width * source_image.channels) {
+    throw std::invalid_argument("Invalid source image row stride.");
   }
 
-  DeviceImage<Npp8u> source(grayscale.width, grayscale.height);
-  DeviceImage<Npp8u> blurred(grayscale.width, grayscale.height);
-  DeviceImage<Npp16s> gradient_x(grayscale.width, grayscale.height);
-  DeviceImage<Npp16s> gradient_y(grayscale.width, grayscale.height);
-  DeviceImage<Npp8u> binary(grayscale.width, grayscale.height);
-  DeviceImage<Npp8u> closed(grayscale.width, grayscale.height);
-  DeviceImage<Npp8u> temporary(grayscale.width, grayscale.height);
+  constexpr Npp32f kBgrToGrayCoefficients[3] = {0.114F, 0.587F, 0.299F};
+  constexpr int kGradientVisualizationScale = 4;
+  const NppStreamContext stream_context = get_npp_stream_context();
 
-  source.copy_from_host(grayscale.pixels.data(), grayscale.row_stride);
+  DeviceImage<Npp8u> grayscale(source_image.width, source_image.height);
+  DeviceImage<Npp8u> blurred(source_image.width, source_image.height);
+  DeviceImage<Npp16s> gradient_x(source_image.width, source_image.height);
+  DeviceImage<Npp16s> gradient_y(source_image.width, source_image.height);
+  DeviceImage<Npp8u> sobel_edge(source_image.width, source_image.height);
+  DeviceImage<Npp8u> binary(source_image.width, source_image.height);
+  DeviceImage<Npp8u> closed(source_image.width, source_image.height);
+  DeviceImage<Npp8u> temporary(source_image.width, source_image.height);
 
-  const NppiSize image_size{grayscale.width, grayscale.height};
+  const NppiSize image_size{source_image.width, source_image.height};
   constexpr NppiPoint image_offset{0, 0};
 
-  PLATE_NPP_CHECK(nppiFilterGaussBorder_8u_C1R(
-      source.data(), source.step(), image_size, image_offset, blurred.data(),
-      blurred.step(), image_size, NPP_MASK_SIZE_5_X_5, NPP_BORDER_REPLICATE));
+  if (source_image.channels == 3) {
+    DeviceImage<Npp8u> source_color(source_image.width * source_image.channels,
+                                    source_image.height);
+    source_color.copy_from_host(source_image.pixels.data(),
+                                source_image.row_stride);
+    PLATE_NPP_CHECK(nppiColorToGray_8u_C3C1R_Ctx(
+        source_color.data(), source_color.step(), grayscale.data(),
+        grayscale.step(), image_size, kBgrToGrayCoefficients, stream_context));
+  } else {
+    DeviceImage<Npp8u> source_grayscale(source_image.width,
+                                        source_image.height);
+    source_grayscale.copy_from_host(source_image.pixels.data(),
+                                    source_image.row_stride);
+    PLATE_CUDA_CHECK(cudaMemcpy2D(
+        grayscale.data(), grayscale.pitch(), source_grayscale.data(),
+        source_grayscale.pitch(), static_cast<std::size_t>(source_image.width),
+        source_image.height, cudaMemcpyDeviceToDevice));
+  }
+  emit_stage_if_requested(grayscale, source_image.width, source_image.height,
+                          "grayscale", stage_callback);
 
-  PLATE_NPP_CHECK(nppiFilterSobelHorizBorder_8u16s_C1R(
+  PLATE_NPP_CHECK(nppiFilterGaussBorder_8u_C1R_Ctx(
+      grayscale.data(), grayscale.step(), image_size, image_offset,
+      blurred.data(), blurred.step(), image_size, NPP_MASK_SIZE_5_X_5,
+      NPP_BORDER_REPLICATE, stream_context));
+  emit_stage_if_requested(blurred, source_image.width, source_image.height,
+                          "gauss-blur", stage_callback);
+
+  PLATE_NPP_CHECK(nppiFilterSobelHorizBorder_8u16s_C1R_Ctx(
       blurred.data(), blurred.step(), image_size, image_offset,
       gradient_x.data(), gradient_x.step(), image_size, NPP_MASK_SIZE_3_X_3,
-      NPP_BORDER_REPLICATE));
+      NPP_BORDER_REPLICATE, stream_context));
 
-  PLATE_NPP_CHECK(nppiFilterSobelVertBorder_8u16s_C1R(
+  PLATE_NPP_CHECK(nppiFilterSobelVertBorder_8u16s_C1R_Ctx(
       blurred.data(), blurred.step(), image_size, image_offset,
       gradient_y.data(), gradient_y.step(), image_size, NPP_MASK_SIZE_3_X_3,
-      NPP_BORDER_REPLICATE));
+      NPP_BORDER_REPLICATE, stream_context));
 
   constexpr dim3 block_size{16, 16, 1};
   const dim3 grid_size{
-      ((grayscale.width + block_size.x - 1) / block_size.x),
-      ((grayscale.height + block_size.y - 1) / block_size.y),
-      1};
+      ((source_image.width + block_size.x - 1) / block_size.x),
+      ((source_image.height + block_size.y - 1) / block_size.y), 1};
+
+  gradient_visualization_kernel<<<grid_size, block_size>>>(
+      gradient_x.data(), gradient_x.pitch(), gradient_y.data(),
+      gradient_y.pitch(), sobel_edge.data(), sobel_edge.pitch(),
+      source_image.width, source_image.height, kGradientVisualizationScale);
+  PLATE_CUDA_CHECK(cudaGetLastError());
+  emit_stage_if_requested(sobel_edge, source_image.width, source_image.height,
+                          "sobel-edge", stage_callback);
 
   gradient_threshold_kernel<<<grid_size, block_size>>>(
       gradient_x.data(), gradient_x.pitch(), gradient_y.data(),
-      gradient_y.pitch(), binary.data(), binary.pitch(), grayscale.width,
-      grayscale.height, config.gradient_threshold);
+      gradient_y.pitch(), binary.data(), binary.pitch(), source_image.width,
+      source_image.height, config.gradient_threshold);
   PLATE_CUDA_CHECK(cudaGetLastError());
+  emit_stage_if_requested(binary, source_image.width, source_image.height,
+                          "binary-mask", stage_callback);
 
   launch_rect_kernel(grid_size, block_size, true, binary.data(), binary.pitch(),
-                     temporary.data(), temporary.pitch(), grayscale.width,
-                     grayscale.height, config.closing_radius_x,
+                     temporary.data(), temporary.pitch(), source_image.width,
+                     source_image.height, config.closing_radius_x,
                      config.closing_radius_y);
   PLATE_CUDA_CHECK(cudaGetLastError());
 
   launch_rect_kernel(grid_size, block_size, false, temporary.data(),
                      temporary.pitch(), closed.data(), closed.pitch(),
-                     grayscale.width, grayscale.height, config.closing_radius_x,
-                     config.closing_radius_y);
+                     source_image.width, source_image.height,
+                     config.closing_radius_x, config.closing_radius_y);
   PLATE_CUDA_CHECK(cudaGetLastError());
   PLATE_CUDA_CHECK(cudaDeviceSynchronize());
+  emit_stage_if_requested(closed, source_image.width, source_image.height,
+                          "closed-mask", stage_callback);
 
-  image::ImageBuffer mask;
-  mask.width = grayscale.width;
-  mask.height = grayscale.height;
-  mask.channels = 1;
-  mask.row_stride = grayscale.width;
-  mask.pixels.resize(static_cast<std::size_t>(mask.row_stride) * mask.height);
-  closed.copy_to_host(mask.pixels.data(), mask.row_stride);
-
-  return mask;
+  return copy_device_image_to_host(closed, source_image.width,
+                                   source_image.height);
 }
 
 }  // namespace plate::filter

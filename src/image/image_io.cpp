@@ -75,4 +75,17 @@ std::filesystem::path make_output_path(
   return parent / (stem + "-out" + extension);
 }
 
+std::filesystem::path make_stage_output_path(
+    const std::filesystem::path &input_path,
+    const std::filesystem::path &output_directory,
+    const std::string_view stage_name) {
+  const auto stem = input_path.stem().string();
+  auto extension = input_path.extension().string();
+  if (extension.empty()) {
+    extension = ".png";
+  }
+
+  return output_directory / (stem + "-" + std::string(stage_name) + extension);
+}
+
 }  // namespace plate::image
