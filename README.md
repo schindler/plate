@@ -5,16 +5,24 @@
 The pipeline is intentionally simple:
 
 1. Load the image on the CPU.
-2. Convert to grayscale on the GPU.
-3. Run Gaussian smoothing and Sobel edge extraction on the GPU with NPP.
-4. Build the binary candidate mask on the GPU.
-5. Score connected components on the CPU using license-plate-like geometry.
-6. Draw a rectangle on the original image and save `<input>-out.<ext>`.
-
-This is a baseline detector, not a trained model. It works best on single-vehicle images with one clearly visible front or rear plate.
+2. Resize image ~1080x600 ratio `GPU`
+3. Convert to grayscale on the `GPU`
+4. Run Gaussian smoothing and Sobel edge extraction on the `GPU` with NPP.
+6. Build the binary candidate mask on the `GPU`
+7. Score connected (Connected-Component Labeling CCL using Label Propagation) components on the `GPU`
+8. Draw a rectangle on the original image and save `<input>-out.<ext>`CPU
 
 Detailed installation instructions are in `INSTALL`.
 
+## Samples
+
+**Many thanks**
+
+- Car[05,06] <a href="https://unsplash.com/pt-br/@arteum?utm_source=unsplash&utm_medium=referral&utm_content=creditCopyText">Arteum.ro</a> at <a href="https://unsplash.com/pt-br/fotografias/carro-bmw-preto-estacionado-na-estrada-oaMFDtSqHXY?utm_source=unsplash&utm_medium=referral&utm_content=creditCopyText">Unsplash</a>
+
+- Car[04] <a href="https://unsplash.com/pt-br/@flixxi?utm_source=unsplash&utm_medium=referral&utm_content=creditCopyText">Felix Janßen</a> at <a href="https://unsplash.com/pt-br/fotografias/porsche-911-preto-estacionado-no-chao-branco-2eMJDJM9vxk?utm_source=unsplash&utm_medium=referral&utm_content=creditCopyText">Unsplash</a>
+      
+      
 ## Code organization
 
 ```text
@@ -48,6 +56,13 @@ Detailed installation instructions are in `INSTALL`.
 ## Build Summary
 
 The project is designed to compile in Docker on macOS and directly on Linux. The executable is written to `bin/` when you build it.
+
+Quick Linux build:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
 
 On Apple Silicon, Docker defaults to `linux/arm64`. If your target runtime machine is a typical x86_64 Linux NVIDIA box, build with `--platform=linux/amd64`.
 
@@ -99,6 +114,10 @@ This writes files such as `debug/audi-grayscale.png`,
 ## Notes and limitations
 
 - The detector is heuristic-based and tuned for rectangular plates with strong edge contrast.
-- The current implementation expects 8-bit images and saves 8-bit `png/jpg/jpeg`.
+- The current implementation expects  `png/jpg/jpeg`.
 - Image decoding/encoding is handled by OpenCV inside the `image` module; the filtering path uses CUDA/NPP.
-- For better accuracy later, the current module split makes it straightforward to replace the detector with a learned model while keeping the same CLI and image I/O.
+- It is not intend to detected real license plates
+
+## Example
+
+![Execution](data/images/about/execution.png)

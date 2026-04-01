@@ -26,7 +26,10 @@ void draw_horizontal_line(image::ImageBuffer &image, const int y, const int x0,
   const int start = std::max(0, x0);
   const int end = std::min(image.width - 1, x1);
   for (int x = start; x <= end; ++x) {
-    paint_pixel(image, x, y, color);
+    for (int off{-5}; off <=5; ++off ) {
+       if (y+off>=0 && y+off<image.height)
+       paint_pixel(image, x, y+off, color);
+    }
   }
 }
 

@@ -9,6 +9,7 @@ struct BoundingBox {
   int y{};
   int width{};
   int height{};
+  float score;
 
   [[nodiscard]] bool empty() const noexcept {
     return width <= 0 || height <= 0;

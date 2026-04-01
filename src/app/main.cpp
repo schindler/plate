@@ -65,21 +65,17 @@ int main(const int argc, char **argv) {
         const auto stage_output_path = plate::image::make_stage_output_path(
             input_path, debug_directory, stage_name);
         plate::image::save_image(stage_output_path, stage_image);
-        std::cout << "Wrote debug stage " << stage_output_path << '\n';
+        std::cout << "Wrote debug stage [" << stage_image.width << ", " << stage_image.height << "] " << stage_output_path << std::endl;
       };
     }
 
-    if (const auto detection =
-            plate::detector::detect_license_plate(color, stage_callback);
-        detection.found()) {
-      plate::draw::draw_rectangle(color, detection.box);
-      std::cout << "Detected candidate: x=" << detection.box.x
-                << " y=" << detection.box.y << " w=" << detection.box.width
-                << " h=" << detection.box.height << " score=" << detection.score
+    for (const auto& box: plate::detector::detect_license_plate(color, stage_callback)) {
+      plate::draw::draw_rectangle(color, box);
+      std::cout << "Detected candidate: x=" << box.x
+                << " y=" << box.y << " w=" << box.width
+                << " h=" << box.height 
                 << '\n';
-    } else {
-      std::cout << "No plausible plate candidate found.\n";
-    }
+    } 
 
     const auto output_path = plate::image::make_output_path(input_path);
     plate::image::save_image(output_path, color);

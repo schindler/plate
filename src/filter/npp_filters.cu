@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
-#include <nppcore.h>
-#include <nppi_color_conversion.h>
-#include <nppi_filtering_functions.h>
+#include <npp.h>
+//#include <nppi_color_conversion.h>
+//#include <nppi_filtering_functions.h>
 
 #include <cstdint>
 #include <limits>
@@ -259,17 +259,133 @@ void emit_stage_if_requested(const DeviceImage<Npp8u> &device_image,
 
 }  // namespace
 
+std::tuple<int, int> calculate_down_scale(int srcW, int srcH, int maxW = 1080, int maxH = 600) {
+    // If image is already smaller than target, we don't need to downscale
+    if (srcW <= maxW && srcH <= maxH) {
+        return {srcW, srcH};
+    }
+
+    // Calculate scaling factors
+    float scaleW = static_cast<float>(maxW) / srcW;
+    float scaleH = static_cast<float>(maxH) / srcH;
+
+    // Use the smaller scale to ensure it fits within BOTH bounds
+    float scale = std::min(scaleW, scaleH);
+
+    printf("Scale: %.02f\n", scale);
+
+    return {
+        static_cast<int>(srcW * scale),
+        static_cast<int>(srcH * scale)
+    };
+}
+
+image::ImageBuffer resize3ChannelNPP(const image::ImageBuffer& src, int newWidth, int newHeight) {
+    image::ImageBuffer dst;
+    dst.width = newWidth;
+    dst.height = newHeight;
+    dst.channels = 3; // Ensure this is set to 3
+    dst.row_stride = newWidth * 3; // 3 bytes per pixel
+    dst.pixels.resize(dst.row_stride * dst.height);
+
+    NppiSize srcSize = { src.width, src.height };
+    NppiRect srcRoi  = { 0, 0, src.width, src.height };
+    
+    NppiSize dstSize = { dst.width, dst.height };
+    NppiRect dstRoi  = { 0, 0, dst.width, dst.height };
+
+    uint8_t *d_src, *d_dst;
+    size_t srcStep, dstStep;
+    
+    // IMPORTANT: cudaMallocPitch width is in BYTES. 
+    // So we multiply width by 3 for C3.
+    cudaMallocPitch((void**)&d_src, &srcStep, src.width * 3, src.height);
+    cudaMallocPitch((void**)&d_dst, &dstStep, dst.width * 3, dst.height);
+
+    // Copy source to device
+    cudaMemcpy2D(d_src, srcStep, src.pixels.data(), src.row_stride, 
+                 src.width * 3, src.height, cudaMemcpyHostToDevice);
+
+    // Execute 3-Channel Resize
+    // Note: C3R instead of C1R
+    PLATE_NPP_CHECK(nppiResize_8u_C3R(
+        d_src, (int)srcStep, srcSize, srcRoi,
+        d_dst, (int)dstStep, dstSize, dstRoi,
+        NPPI_INTER_LINEAR
+    ));
+
+    // Copy result back to host
+    cudaMemcpy2D(dst.pixels.data(), dst.row_stride, d_dst, dstStep, 
+                 dst.width * 3, dst.height, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_src);
+    cudaFree(d_dst);
+
+    return dst;
+}
+
+__host__ image::ImageBuffer resize(const image::ImageBuffer& src, int newWidth, int newHeight) {
+    image::ImageBuffer dst;
+    dst.width = newWidth;
+    dst.height = newHeight;
+    dst.channels = src.channels;
+    dst.row_stride = newWidth * src.channels; // Simple stride
+    dst.pixels.resize(dst.row_stride * dst.height);
+
+    // 1. Setup NPP Sizes and Rects
+    NppiSize srcSize = { src.width, src.height };
+    NppiRect srcRoi  = { 0, 0, src.width, src.height };
+    
+    NppiSize dstSize = { dst.width, dst.height };
+    NppiRect dstRoi  = { 0, 0, dst.width, dst.height };
+
+    // 2. Allocate Device Memory
+    uint8_t *d_src, *d_dst;
+    size_t srcStep, dstStep;
+    
+    // Using cudaMallocPitch is recommended for NPP to ensure memory alignment
+    cudaMallocPitch((void**)&d_src, &srcStep, src.width, src.height);
+    cudaMallocPitch((void**)&d_dst, &dstStep, dst.width, dst.height);
+
+    // 3. Copy source from Host to Device
+    // We use cudaMemcpy2D because the device might have added padding (pitch)
+    cudaMemcpy2D(d_src, srcStep, src.pixels.data(), src.row_stride, 
+                 src.width, src.height, cudaMemcpyHostToDevice);
+
+    // 4. Execute NPP Resize
+    // _8u (unsigned 8-bit), _C1 (1 channel), _R (ROI-based)
+    PLATE_NPP_CHECK(nppiResize_8u_C3R(
+        d_src, srcStep, srcSize, srcRoi,
+        d_dst, dstStep, dstSize, dstRoi,
+        NPPI_INTER_LINEAR
+    ));
+
+    // 5. Copy back to Host
+    cudaMemcpy2D(dst.pixels.data(), dst.row_stride, d_dst, dstStep, 
+                 dst.width, dst.height, cudaMemcpyDeviceToHost);
+
+    // Cleanup
+    cudaFree(d_src);
+    cudaFree(d_dst);
+
+    return dst;
+}
+
 image::ImageBuffer build_plate_candidate_mask(
-    const image::ImageBuffer &source_image, const PlateMaskConfig &config,
+    const image::ImageBuffer &image, const PlateMaskConfig &config,
     const FilterStageCallback &stage_callback) {
-  if (source_image.channels != 1 && source_image.channels != 3) {
+  if (image.channels != 1 && image.channels != 3) {
     throw std::invalid_argument(
         "Plate mask generation expects a 1-channel or 3-channel image.");
   }
 
-  if (source_image.row_stride < source_image.width * source_image.channels) {
+  if (image.row_stride < image.width * image.channels) {
     throw std::invalid_argument("Invalid source image row stride.");
   }
+
+
+  auto [w,h]=calculate_down_scale(image.width, image.height);
+  image::ImageBuffer source_image = resize3ChannelNPP(image, w, h);
 
   constexpr Npp32f kBgrToGrayCoefficients[3] = {0.114F, 0.587F, 0.299F};
   constexpr int kGradientVisualizationScale = 4;

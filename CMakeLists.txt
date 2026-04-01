@@ -20,6 +20,7 @@ file(MAKE_DIRECTORY ${PLATE_BIN_DIR})
 
 add_library(plate_lib
     src/detector/license_plate_detector.cpp
+    src/detector/ccl.cu
     src/draw/draw.cpp
     src/filter/npp_filters.cu
     src/image/image_io.cpp
@@ -38,6 +39,7 @@ target_link_libraries(plate_lib
         CUDA::nppc
         CUDA::nppicc
         CUDA::nppif
+        CUDA::nppig
         ${OpenCV_LIBS}
 )
 
