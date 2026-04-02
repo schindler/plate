@@ -2,8 +2,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
-#include <iostream>
 #include <vector>
 
 #include "plate/core/bounding_box.hpp"
@@ -103,13 +103,16 @@ __global__ void computeBBoxes(const int* labels, int* minX, int* minY,
 }  // namespace
 
 __host__ std::vector<core::BoundingBox> find_candidates(
-    const image::ImageBuffer& img, float scale) {
-  if (img.empty() || img.channels != 1) return {};
+    const image::ImageBuffer& img, const float scale,
+    const DetectorConfig& config) {
+  if (img.empty() || img.channels != 1) {
+    return {};
+  }
 
-  int w = img.width;
-  int h = img.height;
-  int num_pixels = w * h;
-  size_t mem_size = num_pixels * sizeof(int);
+  const int w = img.width;
+  const int h = img.height;
+  const int num_pixels = w * h;
+  const size_t mem_size = static_cast<size_t>(num_pixels) * sizeof(int);
 
   // 1. Allocate Device Memory
   uint8_t* d_img = nullptr;
@@ -150,6 +153,7 @@ __host__ std::vector<core::BoundingBox> find_candidates(
 
   // 3. Run Kernels
   init_labels<<<gridSize, blockSize>>>(d_img, d_labels, w, h);
+  PLATE_CUDA_CHECK(cudaGetLastError());
 
   bool h_changed = true;
   while (h_changed) {
@@ -158,7 +162,9 @@ __host__ std::vector<core::BoundingBox> find_candidates(
                                 cudaMemcpyHostToDevice));
 
     propagate_labels<<<gridSize, blockSize>>>(d_labels, w, h, d_changed);
+    PLATE_CUDA_CHECK(cudaGetLastError());
     compress_paths<<<gridSize, blockSize>>>(d_labels, w, h);
+    PLATE_CUDA_CHECK(cudaGetLastError());
 
     PLATE_CUDA_CHECK(cudaMemcpy(&h_changed, d_changed, sizeof(bool),
                                 cudaMemcpyDeviceToHost));
@@ -166,6 +172,7 @@ __host__ std::vector<core::BoundingBox> find_candidates(
 
   computeBBoxes<<<gridSize, blockSize>>>(d_labels, d_minX, d_minY, d_maxX,
                                          d_maxY, d_counts, w, h);
+  PLATE_CUDA_CHECK(cudaGetLastError());
 
   // 4. Copy Bounding Boxes back to Host
   std::vector<int> minX(num_pixels), minY(num_pixels), maxX(num_pixels),
@@ -194,37 +201,31 @@ __host__ std::vector<core::BoundingBox> find_candidates(
   // 5. Filter and Score Candidates on CPU
   std::vector<core::BoundingBox> candidates;
 
-  //TODO: it shloud be provided as parameter
-  const float MIN_RATIO = 3.0f, MAX_RATIO = 6.5f;
-  const int MIN_AREA = 2500, MAX_AREA = 20000;
-  const float MIN_DENSITY = 0.5f;
-  //---------------------------------------
+  constexpr float kMinRatioMultiplier = 0.75F;
+  constexpr float kMaxRatioMultiplier = 1.625F;
+  const float min_ratio = config.expected_plate_ratio * kMinRatioMultiplier;
+  const float max_ratio = config.expected_plate_ratio * kMaxRatioMultiplier;
 
   for (int i = 0; i < num_pixels; ++i) {
     if (counts[i] > 0) {
-      int bw = maxX[i] - minX[i] + 1;
-      int bh = maxY[i] - minY[i] + 1;
-      int b_area = bw * bh;
-      float ratio = static_cast<float>(bw) / static_cast<float>(bh); 
+      const int bw = maxX[i] - minX[i] + 1;
+      const int bh = maxY[i] - minY[i] + 1;
+      const int b_area = bw * bh;
+      const float ratio = static_cast<float>(bw) / static_cast<float>(bh);
 
-      if (b_area >= MIN_AREA && b_area <= MAX_AREA) {
-        
-        if (ratio >= MIN_RATIO && ratio <= MAX_RATIO) {
-          float density = static_cast<float>(counts[i]) / b_area;
-          if (density >= MIN_DENSITY) {
-            // Give it a score. Here, we reward blobs that are closer to
-            // a standard license plate ratio (e.g., ~3.0) and have higher
-            // density.
-            float ideal_ratio_diff = std::abs(ratio - 4.0f);
-            float score = density - (ideal_ratio_diff *
-                                     0.1f);  // Lower difference = higher score
-            candidates.push_back({(int)(minX[i] / scale),
-                                  (int)(minY[i] / scale), (int)(bw / scale),
-                                  (int)(bh / scale), score});
+      if (b_area >= config.min_area && b_area <= config.max_area) {
+        if (ratio >= min_ratio && ratio <= max_ratio) {
+          const float density = static_cast<float>(counts[i]) / b_area;
+          if (density >= config.min_density) {
+            const float ideal_ratio_diff =
+                std::abs(ratio - config.expected_plate_ratio);
+            const float score = density - (ideal_ratio_diff * 0.1F);
+            candidates.push_back({static_cast<int>(minX[i] / scale),
+                                  static_cast<int>(minY[i] / scale),
+                                  static_cast<int>(bw / scale),
+                                  static_cast<int>(bh / scale), score});
           }
         }
-      } else {
-       // printf("Disposed %d-%.02f\n", b_area, ratio);
       }
     }
   }

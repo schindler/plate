@@ -1,16 +1,16 @@
 # Overview
 
-`plate` is a small CUDA/C++ sample project that uses NVIDIA NPP for GPU-side image filtering and a simple classical heuristic to locate a likely license plate region in a `.png`, `.jpg`, or `.jpeg` image.
+`plate` is a small CUDA/C++ sample project that uses NVIDIA NPP for GPU-side image filtering and a simple classical heuristic to locate a likely license plate region in one or more `.png`, `.jpg`, or `.jpeg` images.
 
 The pipeline is intentionally simple:
 
 1. Load the image on the CPU.
-2. Resize image ~1080x600 ratio `GPU`
-3. Convert to grayscale on the `GPU`
+2. Resize the image on the `GPU` to an auto-selected working size around `1080x600`, or use a user-provided `--scale`.
+3. Convert to grayscale on the `GPU`.
 4. Run Gaussian smoothing and Sobel edge extraction on the `GPU` with NPP.
-6. Build the binary candidate mask on the `GPU`
-7. Score connected (Connected-Component Labeling CCL using Label Propagation) components on the `GPU`
-8. Draw a rectangle on the original image and save `<input>-out.<ext>`CPU
+5. Build the binary candidate mask on the `GPU`.
+6. Score connected components on the `GPU` with label propagation and candidate heuristics.
+7. Draw a rectangle on the original image and save `<input>-out.<ext>`.
 
 Detailed installation instructions are in `INSTALL`.
 
@@ -34,6 +34,7 @@ Detailed installation instructions are in `INSTALL`.
 ├── Dockerfile
 ├── INSTALL
 ├── include/plate
+│   ├── cli
 │   ├── core
 │   ├── detector
 │   ├── draw
@@ -41,6 +42,7 @@ Detailed installation instructions are in `INSTALL`.
 │   └── image
 ├── src
 │   ├── app
+│   ├── cli
 │   ├── detector
 │   ├── draw
 │   ├── filter
@@ -50,6 +52,7 @@ Detailed installation instructions are in `INSTALL`.
 
 - `bin/` holds generated executables. After a successful build, the main CLI is written here as `bin/plate`.
 - `data/` holds lightweight example data for the repository. Right now it contains sample input images under `data/images/samples/`, including `audi.png`.
+- `include/plate/cli/` and `src/cli/` hold command-line parsing and usage handling for the executable.
 - `include/plate/` holds public headers grouped by module.
 - `src/` holds the implementation files for the application entrypoint and each module.
 
@@ -98,7 +101,13 @@ Run the program on a Linux machine with a working CUDA runtime:
 ./bin/plate data/images/samples/audi.png
 ```
 
-If a plausible candidate is found, the tool writes `data/images/samples/audi-out.png`.
+To process multiple files in one invocation, pass more than one input path:
+
+```bash
+./bin/plate data/images/samples/audi.png data/images/samples/car05.jpg
+```
+
+Each input is processed independently and writes its own `<input>-out.<ext>` file.
 
 To save the intermediate GPU stages under a `debug/` folder beside the input
 image, use:
@@ -111,12 +120,28 @@ This writes files such as `debug/audi-grayscale.png`,
 `debug/audi-gauss-blur.png`, `debug/audi-sobel-edge.png`,
 `debug/audi-binary-mask.png`, and `debug/audi-closed-mask.png`.
 
+You can also tune the detector from the command line:
+
+```bash
+./bin/plate \
+  --scale 0.50 \
+  --plate-ratio 4.2 \
+  --min-area 1800 \
+  --max-area 24000 \
+  data/images/samples/audi.png
+```
+
+- `--scale` forces the preprocessing resize factor. If omitted, the tool keeps the current automatic resize calculation.
+- `--plate-ratio` and `--expected-plate-ratio` are aliases. They define the expected plate `width / height` ratio used by the CCL scoring stage.
+- `--min-area` and `--max-area` control the connected-component area filter in pixels on the resized working image.
+- `--debug` saves one image per GPU stage beside each input file inside a `debug/` folder.
+
 ## Notes and limitations
 
 - The detector is heuristic-based and tuned for rectangular plates with strong edge contrast.
-- The current implementation expects  `png/jpg/jpeg`.
+- The current implementation expects `png`, `jpg`, or `jpeg` inputs.
 - Image decoding/encoding is handled by OpenCV inside the `image` module; the filtering path uses CUDA/NPP.
-- It is not intend to detected real license plates
+- It is a heuristic demo and is not intended for production-grade license plate recognition.
 
 ## Example
 

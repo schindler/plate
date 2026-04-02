@@ -1,8 +1,8 @@
 #include <cuda_runtime.h>
 #include <npp.h>
-//#include <nppi_color_conversion.h>
-//#include <nppi_filtering_functions.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -257,119 +257,100 @@ void emit_stage_if_requested(const DeviceImage<Npp8u> &device_image,
                  copy_device_image_to_host(device_image, width, height));
 }
 
-}  // namespace
+struct ResizeDimensions {
+  int width{};
+  int height{};
+};
 
-std::tuple<int, int> calculate_down_scale(int srcW, int srcH, int maxW = 1080, int maxH = 600) {
-    // If image is already smaller than target, we don't need to downscale
-    if (srcW <= maxW && srcH <= maxH) {
-        return {srcW, srcH};
+ResizeDimensions calculate_resize_dimensions(const image::ImageBuffer &source,
+                                             const PlateMaskConfig &config) {
+  if (config.scale.has_value()) {
+    if (*config.scale <= 0.0F) {
+      throw std::invalid_argument("Scale must be a positive number.");
     }
 
-    // Calculate scaling factors
-    float scaleW = static_cast<float>(maxW) / srcW;
-    float scaleH = static_cast<float>(maxH) / srcH;
+    return {std::max(
+                1, static_cast<int>(std::lround(source.width * *config.scale))),
+            std::max(1, static_cast<int>(
+                            std::lround(source.height * *config.scale)))};
+  }
 
-    // Use the smaller scale to ensure it fits within BOTH bounds
-    float scale = std::min(scaleW, scaleH);
+  if (source.width <= config.target_max_width &&
+      source.height <= config.target_max_height) {
+    return {source.width, source.height};
+  }
 
-    printf("Scale: %.02f\n", scale);
+  const float scale_width =
+      static_cast<float>(config.target_max_width) / source.width;
+  const float scale_height =
+      static_cast<float>(config.target_max_height) / source.height;
+  const float scale = std::min(scale_width, scale_height);
 
-    return {
-        static_cast<int>(srcW * scale),
-        static_cast<int>(srcH * scale)
-    };
+  return {std::max(1, static_cast<int>(std::lround(source.width * scale))),
+          std::max(1, static_cast<int>(std::lround(source.height * scale)))};
 }
 
-image::ImageBuffer resize3ChannelNPP(const image::ImageBuffer& src, int newWidth, int newHeight) {
-    image::ImageBuffer dst;
-    dst.width = newWidth;
-    dst.height = newHeight;
-    dst.channels = 3; // Ensure this is set to 3
-    dst.row_stride = newWidth * 3; // 3 bytes per pixel
-    dst.pixels.resize(dst.row_stride * dst.height);
+image::ImageBuffer resize_with_npp(const image::ImageBuffer &source,
+                                   const int new_width, const int new_height) {
+  if (source.channels != 1 && source.channels != 3) {
+    throw std::invalid_argument(
+        "NPP resize expects a 1-channel or 3-channel image.");
+  }
+  if (new_width <= 0 || new_height <= 0) {
+    throw std::invalid_argument("NPP resize expects positive dimensions.");
+  }
 
-    NppiSize srcSize = { src.width, src.height };
-    NppiRect srcRoi  = { 0, 0, src.width, src.height };
-    
-    NppiSize dstSize = { dst.width, dst.height };
-    NppiRect dstRoi  = { 0, 0, dst.width, dst.height };
+  if (source.width == new_width && source.height == new_height) {
+    return source;
+  }
 
-    uint8_t *d_src, *d_dst;
-    size_t srcStep, dstStep;
-    
-    // IMPORTANT: cudaMallocPitch width is in BYTES. 
-    // So we multiply width by 3 for C3.
-    cudaMallocPitch((void**)&d_src, &srcStep, src.width * 3, src.height);
-    cudaMallocPitch((void**)&d_dst, &dstStep, dst.width * 3, dst.height);
+  image::ImageBuffer destination;
+  destination.width = new_width;
+  destination.height = new_height;
+  destination.channels = source.channels;
+  destination.row_stride = new_width * source.channels;
+  destination.pixels.resize(static_cast<std::size_t>(destination.row_stride) *
+                            destination.height);
 
-    // Copy source to device
-    cudaMemcpy2D(d_src, srcStep, src.pixels.data(), src.row_stride, 
-                 src.width * 3, src.height, cudaMemcpyHostToDevice);
+  const NppiSize source_size = {source.width, source.height};
+  const NppiRect source_roi = {0, 0, source.width, source.height};
+  const NppiSize destination_size = {destination.width, destination.height};
+  const NppiRect destination_roi = {0, 0, destination.width,
+                                    destination.height};
+  const NppStreamContext stream_context = get_npp_stream_context();
 
-    // Execute 3-Channel Resize
-    // Note: C3R instead of C1R
-    PLATE_NPP_CHECK(nppiResize_8u_C3R(
-        d_src, (int)srcStep, srcSize, srcRoi,
-        d_dst, (int)dstStep, dstSize, dstRoi,
-        NPPI_INTER_LINEAR
-    ));
+  DeviceImage<Npp8u> source_device(source.width * source.channels,
+                                   source.height);
+  DeviceImage<Npp8u> destination_device(
+      destination.width * destination.channels, destination.height);
+  source_device.copy_from_host(source.pixels.data(), source.row_stride);
 
-    // Copy result back to host
-    cudaMemcpy2D(dst.pixels.data(), dst.row_stride, d_dst, dstStep, 
-                 dst.width * 3, dst.height, cudaMemcpyDeviceToHost);
+  switch (source.channels) {
+    case 1:
+      PLATE_NPP_CHECK(nppiResize_8u_C1R_Ctx(
+          source_device.data(), source_device.step(), source_size, source_roi,
+          destination_device.data(), destination_device.step(),
+          destination_size, destination_roi, NPPI_INTER_LINEAR,
+          stream_context));
+      break;
+    case 3:
+      PLATE_NPP_CHECK(nppiResize_8u_C3R_Ctx(
+          source_device.data(), source_device.step(), source_size, source_roi,
+          destination_device.data(), destination_device.step(),
+          destination_size, destination_roi, NPPI_INTER_LINEAR,
+          stream_context));
+      break;
+    default:
+      throw std::invalid_argument(
+          "NPP resize expects a 1-channel or 3-channel image.");
+  }
 
-    cudaFree(d_src);
-    cudaFree(d_dst);
-
-    return dst;
+  destination_device.copy_to_host(destination.pixels.data(),
+                                  destination.row_stride);
+  return destination;
 }
 
-__host__ image::ImageBuffer resize(const image::ImageBuffer& src, int newWidth, int newHeight) {
-    image::ImageBuffer dst;
-    dst.width = newWidth;
-    dst.height = newHeight;
-    dst.channels = src.channels;
-    dst.row_stride = newWidth * src.channels; // Simple stride
-    dst.pixels.resize(dst.row_stride * dst.height);
-
-    // 1. Setup NPP Sizes and Rects
-    NppiSize srcSize = { src.width, src.height };
-    NppiRect srcRoi  = { 0, 0, src.width, src.height };
-    
-    NppiSize dstSize = { dst.width, dst.height };
-    NppiRect dstRoi  = { 0, 0, dst.width, dst.height };
-
-    // 2. Allocate Device Memory
-    uint8_t *d_src, *d_dst;
-    size_t srcStep, dstStep;
-    
-    // Using cudaMallocPitch is recommended for NPP to ensure memory alignment
-    cudaMallocPitch((void**)&d_src, &srcStep, src.width, src.height);
-    cudaMallocPitch((void**)&d_dst, &dstStep, dst.width, dst.height);
-
-    // 3. Copy source from Host to Device
-    // We use cudaMemcpy2D because the device might have added padding (pitch)
-    cudaMemcpy2D(d_src, srcStep, src.pixels.data(), src.row_stride, 
-                 src.width, src.height, cudaMemcpyHostToDevice);
-
-    // 4. Execute NPP Resize
-    // _8u (unsigned 8-bit), _C1 (1 channel), _R (ROI-based)
-    PLATE_NPP_CHECK(nppiResize_8u_C3R(
-        d_src, srcStep, srcSize, srcRoi,
-        d_dst, dstStep, dstSize, dstRoi,
-        NPPI_INTER_LINEAR
-    ));
-
-    // 5. Copy back to Host
-    cudaMemcpy2D(dst.pixels.data(), dst.row_stride, d_dst, dstStep, 
-                 dst.width, dst.height, cudaMemcpyDeviceToHost);
-
-    // Cleanup
-    cudaFree(d_src);
-    cudaFree(d_dst);
-
-    return dst;
-}
+}  // namespace
 
 image::ImageBuffer build_plate_candidate_mask(
     const image::ImageBuffer &image, const PlateMaskConfig &config,
@@ -383,9 +364,9 @@ image::ImageBuffer build_plate_candidate_mask(
     throw std::invalid_argument("Invalid source image row stride.");
   }
 
-
-  auto [w,h]=calculate_down_scale(image.width, image.height);
-  image::ImageBuffer source_image = resize3ChannelNPP(image, w, h);
+  const auto resize_dimensions = calculate_resize_dimensions(image, config);
+  image::ImageBuffer source_image =
+      resize_with_npp(image, resize_dimensions.width, resize_dimensions.height);
 
   constexpr Npp32f kBgrToGrayCoefficients[3] = {0.114F, 0.587F, 0.299F};
   constexpr int kGradientVisualizationScale = 4;

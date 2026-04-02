@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(plate VERSION 0.1.0 LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -19,6 +19,7 @@ set(PLATE_BIN_DIR ${PROJECT_SOURCE_DIR}/bin)
 file(MAKE_DIRECTORY ${PLATE_BIN_DIR})
 
 add_library(plate_lib
+    src/cli/command_line_options.cpp
     src/detector/license_plate_detector.cpp
     src/detector/ccl.cu
     src/draw/draw.cpp
